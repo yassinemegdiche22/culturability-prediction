@@ -1,0 +1,454 @@
+import argparse
+import gzip
+import os
+import warnings
+
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu
+from sklearn.calibration import calibration_curve
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (balanced_accuracy_score, f1_score, roc_auc_score,
+                             roc_curve)
+from sklearn.model_selection import (GroupShuffleSplit, StratifiedGroupKFold,
+                                     StratifiedKFold)
+from sklearn.pipeline import Pipeline
+
+import culturability as base
+
+warnings.filterwarnings("ignore")
+SEED = 42
+
+# Features computable from a plain FASTA (so usable for a new genome)
+EXTRACTABLE = ["genome_size", "gc_percentage", "protein_count", "coding_density"]
+EXTRA_COLS = ["coding_density", "trna_count", "ssu_count", "gtdb_representative"]
+
+
+# ==========================================================================
+# 1. FEATURE EXTRACTION FROM A FASTA
+# ==========================================================================
+def read_fasta(path):
+    op = gzip.open if path.endswith(".gz") else open
+    name, chunks = None, []
+    with op(path, "rt") as f:
+        for line in f:
+            if line.startswith(">"):
+                if name is not None:
+                    yield name, "".join(chunks)
+                name, chunks = line[1:].split()[0], []
+            else:
+                chunks.append(line.strip())
+    if name is not None:
+        yield name, "".join(chunks)
+
+
+_LUT = np.full(256, 255, np.uint8)
+for _i, _c in enumerate(b"ACGT"):
+    _LUT[_c] = _i
+    _LUT[ord(chr(_c).lower())] = _i
+
+
+def _canonical_index(k):
+    comp = {0: 3, 1: 2, 2: 1, 3: 0}
+    canon = np.zeros(4 ** k, dtype=np.int64)
+    for idx in range(4 ** k):
+        digits = [(idx // 4 ** (k - 1 - j)) % 4 for j in range(k)]
+        rc = [comp[d] for d in reversed(digits)]
+        rc_idx = sum(d * 4 ** (k - 1 - j) for j, d in enumerate(rc))
+        canon[idx] = min(idx, rc_idx)
+    return canon
+
+
+def kmer_counts(seq, k=4):
+    a = _LUT[np.frombuffer(seq.encode(), dtype=np.uint8)]
+    n = len(a) - k + 1
+    if n <= 0:
+        return np.zeros(4 ** k)
+    idx = np.zeros(n, np.int64)
+    valid = np.ones(n, bool)
+    for j in range(k):
+        s = a[j:j + n]
+        valid &= s < 4
+        idx = idx * 4 + s
+    return np.bincount(idx[valid], minlength=4 ** k).astype(float)
+
+
+def extract_fasta_features(path, k=4):
+    """Features of one genome (FASTA, .gz accepted).
+
+    Returns: genome_size, gc_percentage, n_contigs, n50, canonical
+    tetranucleotide frequencies (tnf_*), and, if pyrodigal is installed,
+    protein_count + coding_density (same definition as GTDB: Prodigal).
+    """
+    contigs = list(read_fasta(path))
+    lengths = np.array([len(s) for _, s in contigs])
+    size = int(lengths.sum())
+    g = sum(s.upper().count("G") for _, s in contigs)
+    c = sum(s.upper().count("C") for _, s in contigs)
+    a = sum(s.upper().count("A") for _, s in contigs)
+    t = sum(s.upper().count("T") for _, s in contigs)
+    out = {"genome_size": size,
+           "gc_percentage": 100 * (g + c) / max(a + c + g + t, 1),
+           "n_contigs": len(contigs)}
+
+    srt = np.sort(lengths)[::-1]
+    out["n50"] = int(srt[np.searchsorted(np.cumsum(srt), size / 2)])
+
+    canon = _canonical_index(k)
+    counts = sum(kmer_counts(s, k) for _, s in contigs)
+    folded = np.bincount(canon, weights=counts, minlength=4 ** k)
+    keep = np.unique(canon)
+    freqs = folded[keep] / max(folded.sum(), 1)
+    for i, f in zip(keep, freqs):
+        out[f"tnf_{i}"] = f
+
+    try:
+        import pyrodigal
+        seqs = [s.encode() for _, s in contigs]
+        gf = pyrodigal.GeneFinder(meta=size < 100_000)
+        if not gf.meta:
+            gf.train(*seqs)
+        n_genes = coding = 0
+        for s in seqs:
+            genes = gf.find_genes(s)
+            n_genes += len(genes)
+            coding += sum(x.end - x.begin + 1 for x in genes)
+        out["protein_count"] = n_genes
+        out["coding_density"] = 100 * coding / size
+    except ImportError:
+        print("pyrodigal not installed: protein_count and coding_density = NaN "
+              "(pip install pyrodigal)")
+        out["protein_count"] = np.nan
+        out["coding_density"] = np.nan
+    return out
+
+
+# ==========================================================================
+# 2. DATA
+# ==========================================================================
+def load_raw(cache_dir=base.DATA_DIR):
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(cache_dir, "gtdb_report.csv.gz")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, low_memory=False)
+    wanted = set(base.COLUMNS + EXTRA_COLS)
+    print("Downloading GTDB metadata (~150 MB)...")
+    df = pd.read_csv(base.GTDB_URL, sep="\t", compression="gzip",
+                     low_memory=False, usecols=lambda c: c in wanted)
+    df.to_csv(cache, index=False, compression="gzip")
+    return df
+
+
+def prepare(raw, reps_only=True, max_n=80000):
+    """Labels + QC (your build_dataset), taxonomy, de-redundancy, subsampling.
+
+    reps_only=True: keep one genome per species (GTDB representative). Without
+    this, thousands of near-identical genomes (E. coli...) artificially inflate
+    performance.
+    """
+    df, _ = base.build_dataset(raw)
+    for c in ["coding_density", "trna_count", "ssu_count"]:
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["family"] = (df["gtdb_taxonomy"].astype(str)
+                    .str.extract(r"f__([^;]*)")[0].replace("", np.nan))
+    if reps_only and "gtdb_representative" in df:
+        df = df[df["gtdb_representative"].astype(str).str.lower()
+                .isin(["t", "true"])]
+    df = df.dropna(subset=["genus", "family"])
+    df = df[(df["genus"] != "") & (df["family"] != "")]
+    if max_n and len(df) > max_n:
+        df = df.groupby("label", group_keys=False).sample(
+            frac=max_n / len(df), random_state=SEED)
+    return df.reset_index(drop=True)
+
+
+def phylum_levels(df, min_frac=0.01):
+    freq = df["phylum"].value_counts(normalize=True)
+    return sorted(freq[freq >= min_frac].index)
+
+
+def design(df, feats, levels):
+    """Feature matrix; phylum is one-hot encoded (+ 'Other')."""
+    X = df[[f for f in feats if f != "phylum"]].copy()
+    if "phylum" in feats:
+        ph = df["phylum"].where(df["phylum"].isin(levels), "Other")
+        for p in levels + ["Other"]:
+            X["phylum_" + p] = (ph == p).astype(int)
+    return X
+
+
+def feature_sets(df):
+    ext = [c for c in EXTRACTABLE if c in df]
+    full = ext + [c for c in ["trna_aa_count", "trna_count", "ssu_count"]
+                  if c in df]
+    return {"phylum_only": ["phylum"],
+            "extractable": ext,
+            "extractable+phylum": ext + ["phylum"],
+            "full": full,
+            "full+phylum": full + ["phylum"]}
+
+
+def make_model(n_estimators=200):
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("rf", RandomForestClassifier(
+            n_estimators=n_estimators, min_samples_leaf=3,
+            class_weight="balanced_subsample", n_jobs=-1, random_state=SEED))])
+
+
+# ==========================================================================
+# 3. PREDICTABILITY ANALYSIS
+# ==========================================================================
+def univariate(df, feats):
+    """Cultured vs uncultured: medians, Mann-Whitney, Cliff's delta."""
+    rows = []
+    for f in feats:
+        a = df.loc[df.label == 1, f].dropna()
+        b = df.loc[df.label == 0, f].dropna()
+        u, p = mannwhitneyu(a, b, alternative="two-sided")
+        rows.append({"feature": f, "median_cultured": a.median(),
+                     "median_uncultured": b.median(),
+                     "cliffs_delta": 2 * u / (len(a) * len(b)) - 1,
+                     "p_value": p})
+    return pd.DataFrame(rows)
+
+
+def cv_auc(X, y, groups, scheme, n_estimators, n_splits=5):
+    """Per-fold AUC + out-of-fold predictions.
+
+    random : random folds (optimistic, close relatives in both train and test)
+    genus / family : no genus (family) shared between train and test
+                     -> measures generalisation to unseen taxa.
+    """
+    if scheme == "random":
+        splits = StratifiedKFold(n_splits, shuffle=True,
+                                 random_state=SEED).split(X, y)
+    else:
+        splits = StratifiedGroupKFold(n_splits, shuffle=True,
+                                      random_state=SEED).split(X, y, groups)
+    aucs, oof = [], np.zeros(len(y))
+    for tr, te in splits:
+        m = make_model(n_estimators).fit(X.iloc[tr], y.iloc[tr])
+        p = m.predict_proba(X.iloc[te])[:, 1]
+        oof[te] = p
+        aucs.append(roc_auc_score(y.iloc[te], p))
+    return np.array(aucs), oof
+
+
+def leave_one_phylum_out(df, feats, levels, n_estimators, min_n=300):
+    X, y = design(df, feats, levels), df["label"]
+    rows = []
+    for p, g in df.groupby("phylum"):
+        if len(g) < min_n or g.label.value_counts().min() < 30 \
+                or g.label.nunique() < 2:
+            continue
+        te = (df["phylum"] == p).values
+        m = make_model(n_estimators).fit(X[~te], y[~te])
+        rows.append({"phylum": p, "n": len(g),
+                     "frac_cultured": g.label.mean(),
+                     "auc": roc_auc_score(y[te], m.predict_proba(X[te])[:, 1])})
+    return pd.DataFrame(rows).sort_values("auc", ascending=False)
+
+
+def grouped_permutation_importance(model, X, y, groups, n_rep=5):
+    rng = np.random.default_rng(SEED)
+    ref = roc_auc_score(y, model.predict_proba(X)[:, 1])
+    out = {}
+    for name, cols in groups.items():
+        drops = []
+        for _ in range(n_rep):
+            Xp = X.copy()
+            Xp[cols] = X[cols].values[rng.permutation(len(X))]
+            drops.append(ref - roc_auc_score(y, model.predict_proba(Xp)[:, 1]))
+        out[name] = (np.mean(drops), np.std(drops))
+    return ref, out
+
+
+# ==========================================================================
+# 4. FULL PIPELINE
+# ==========================================================================
+def analyze(outdir="results", max_n=80000, all_genomes=False, quick=False):
+    os.makedirs(outdir, exist_ok=True)
+    n_est = 80 if quick else 200
+    raw = load_raw()
+    df = prepare(raw, reps_only=not all_genomes, max_n=20000 if quick else max_n)
+    levels = phylum_levels(df)
+    y = df["label"]
+    print(f"{len(df):,} genomes | cultured: {(y == 1).sum():,} | "
+          f"uncultured: {(y == 0).sum():,} | {df.phylum.nunique()} phyla")
+
+    sets = feature_sets(df)
+    num_feats = [f for f in sets["full"]]
+
+    # -- 4.1 descriptive statistics
+    uni = univariate(df, num_feats)
+    uni.to_csv(f"{outdir}/univariate_tests.csv", index=False)
+    print("\n== Univariate tests (cultured vs uncultured) ==")
+    print(uni.round(4).to_string(index=False))
+
+    fig, axes = plt.subplots(1, len(num_feats), figsize=(3 * len(num_feats), 3.4))
+    for ax, f in zip(np.atleast_1d(axes), num_feats):
+        data = [df.loc[df.label == 0, f].dropna(), df.loc[df.label == 1, f].dropna()]
+        ax.boxplot(data, showfliers=False, labels=["MAG/SAG", "Isolate"])
+        ax.set_title(f, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/fig1_distributions.png", dpi=200)
+    plt.close()
+
+    # -- 4.2 feature sets x validation schemes
+    rows, oofs = [], {}
+    for set_name, feats in sets.items():
+        X = design(df, feats, levels)
+        for scheme, groups in [("random", None), ("genus", df["genus"]),
+                               ("family", df["family"])]:
+            aucs, oof = cv_auc(X, y, groups, scheme, n_est)
+            oofs[(set_name, scheme)] = oof
+            rows.append({"feature_set": set_name, "cv": scheme,
+                         "auc_mean": aucs.mean(), "auc_sd": aucs.std()})
+            print(f"{set_name:20s} {scheme:7s} AUC = {aucs.mean():.3f} "
+                  f"± {aucs.std():.3f}")
+    res = pd.DataFrame(rows)
+    res.to_csv(f"{outdir}/cv_results.csv", index=False)
+    print("\n", res.pivot(index="feature_set", columns="cv",
+                            values="auc_mean").round(3).to_string())
+
+    # Out-of-fold ROC
+    best = "full+phylum" if "full+phylum" in sets else "extractable+phylum"
+    plt.figure(figsize=(5, 5))
+    for scheme in ["random", "genus", "family"]:
+        o = oofs[(best, scheme)]
+        fpr, tpr, _ = roc_curve(y, o)
+        plt.plot(fpr, tpr, label=f"{scheme} (AUC={roc_auc_score(y, o):.3f})")
+    plt.plot([0, 1], [0, 1], "k--", lw=0.8)
+    plt.xlabel("False positive rate"); plt.ylabel("True positive rate")
+    plt.legend()
+    plt.title(f"Out-of-fold ROC — {best}")
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/fig2_roc.png", dpi=200)
+    plt.close()
+
+    # Calibration (genus-grouped CV)
+    frac, mean_p = calibration_curve(y, oofs[(best, "genus")], n_bins=10)
+    plt.figure(figsize=(4.5, 4.5))
+    plt.plot(mean_p, frac, "o-")
+    plt.plot([0, 1], [0, 1], "k--", lw=0.8)
+    plt.xlabel("Predicted probability"); plt.ylabel("Observed fraction (isolates)")
+    plt.title("Calibration (genus-grouped CV)")
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/fig3_calibration.png", dpi=200)
+    plt.close()
+
+    # -- 4.3 generalisation to an unseen phylum
+    lopo = leave_one_phylum_out(df, sets["full"], levels, n_est)
+    lopo.to_csv(f"{outdir}/leave_one_phylum_out.csv", index=False)
+    print("\n== Leave-one-phylum-out (genomic features only) ==")
+    print(lopo.round(3).to_string(index=False))
+    plt.figure(figsize=(6, 0.3 * len(lopo) + 1.5))
+    plt.barh(lopo["phylum"], lopo["auc"])
+    plt.axvline(0.5, color="k", ls="--", lw=0.8)
+    plt.xlabel("AUC on the held-out phylum")
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/fig4_leave_one_phylum_out.png", dpi=200)
+    plt.close()
+
+    # -- 4.4 genus hold-out: metrics at 0.5 + permutation importance
+    X = design(df, sets[best], levels)
+    tr, te = next(GroupShuffleSplit(1, test_size=0.2, random_state=SEED)
+                  .split(X, y, df["genus"]))
+    m = make_model(n_est).fit(X.iloc[tr], y.iloc[tr])
+    proba = m.predict_proba(X.iloc[te])[:, 1]
+    pred = (proba >= 0.5).astype(int)
+    print(f"\n== Genus hold-out ({best}) ==")
+    print(f"AUC {roc_auc_score(y.iloc[te], proba):.3f} | balanced acc "
+          f"{balanced_accuracy_score(y.iloc[te], pred):.3f} | F1 macro "
+          f"{f1_score(y.iloc[te], pred, average='macro'):.3f}")
+
+    groups = {f: [f] for f in sets[best] if f != "phylum"}
+    if "phylum" in sets[best]:
+        groups["phylum"] = [c for c in X.columns if c.startswith("phylum_")]
+    ref, imp = grouped_permutation_importance(m, X.iloc[te], y.iloc[te], groups)
+    imp_df = pd.DataFrame([{"feature": k, "auc_drop": v[0], "sd": v[1]}
+                           for k, v in imp.items()]
+                          ).sort_values("auc_drop", ascending=False)
+    imp_df.to_csv(f"{outdir}/permutation_importance.csv", index=False)
+    print(imp_df.round(4).to_string(index=False))
+    plt.figure(figsize=(5, 3.5))
+    plt.barh(imp_df["feature"], imp_df["auc_drop"], xerr=imp_df["sd"])
+    plt.gca().invert_yaxis()
+    plt.xlabel("AUC drop after permutation")
+    plt.tight_layout()
+    plt.savefig(f"{outdir}/fig5_permutation_importance.png", dpi=200)
+    plt.close()
+
+    # -- 4.5 final models (trained on all data) for prediction from a FASTA
+    bundle = {"phyla_levels": levels, "models": {}}
+    for name in ["extractable", "extractable+phylum"]:
+        feats = sets[name]
+        mod = make_model(n_est).fit(design(df, feats, levels), y)
+        bundle["models"][name] = {"model": mod, "feats": feats}
+    joblib.dump(bundle, f"{outdir}/final_models.joblib")
+    print(f"\nResults and figures saved in {outdir}/")
+
+
+# ==========================================================================
+# 5. PREDICTION ON A NEW GENOME
+# ==========================================================================
+def predict_fasta(path, phylum=None, bundle_path="results/final_models.joblib"):
+    b = joblib.load(bundle_path)
+    f = extract_fasta_features(path)
+    name = "extractable+phylum" if phylum else "extractable"
+    entry = b["models"][name]
+    row = pd.DataFrame([{**f, "phylum": phylum or "Unknown"}])
+    X = design(row, entry["feats"], b["phyla_levels"])
+    p = float(entry["model"].predict_proba(X)[0, 1])
+    d = abs(p - 0.5)
+    return {"model": name, "probability_culturable": round(p, 3),
+            "prediction": "Likely culturable" if p >= 0.5 else "Likely hard to culture",
+            "confidence": "High" if d > 0.3 else "Medium" if d > 0.1 else "Low",
+            "features": {k: round(v, 3) for k, v in f.items()
+                         if not k.startswith("tnf_") and pd.notna(v)}}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawTextHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("analyze")
+    a.add_argument("--outdir", default="results")
+    a.add_argument("--max-n", type=int, default=80000)
+    a.add_argument("--all-genomes", action="store_true",
+                   help="keep all genomes (not only one per species)")
+    a.add_argument("--quick", action="store_true", help="fast test run")
+
+    e = sub.add_parser("extract")
+    e.add_argument("fasta")
+    e.add_argument("--out", default=None)
+
+    p = sub.add_parser("predict")
+    p.add_argument("--fasta", required=True)
+    p.add_argument("--phylum", default=None)
+    p.add_argument("--model", default="results/final_models.joblib")
+
+    args = ap.parse_args()
+    if args.cmd == "analyze":
+        analyze(args.outdir, args.max_n, args.all_genomes, args.quick)
+    elif args.cmd == "extract":
+        feats = extract_fasta_features(args.fasta)
+        df = pd.DataFrame([feats])
+        if args.out:
+            df.to_csv(args.out, index=False)
+        print(df[[c for c in df if not c.startswith("tnf_")]].T)
+    else:
+        print(predict_fasta(args.fasta, args.phylum, args.model))
+
+
+if __name__ == "__main__":
+    main()
